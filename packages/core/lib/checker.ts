@@ -83,19 +83,27 @@ export function getProjectDiagnostics(
 	filePath?: string,
 ): CheckResult {
 	const projectDir = dirname(tsconfigPath);
-	const tscBin = findTscBinary(projectDir);
+	const checker = process.env.TYPE_INJECT_CHECKER === "tsc" ? "tsc" : "bun";
+	// `bun check --no-pretty` prints the same one-line diagnostics as tsc.
+	const [command, args] =
+		checker === "tsc"
+			? [
+					findTscBinary(projectDir),
+					["--noEmit", "--pretty", "false", "--project", tsconfigPath],
+				]
+			: ["bun", ["check", "--no-pretty", "--project", tsconfigPath]];
 
-	const result = spawnSync(
-		tscBin,
-		["--noEmit", "--pretty", "false", "--project", tsconfigPath],
-		{ encoding: "utf8", timeout: 60_000, cwd: projectDir },
-	);
+	const result = spawnSync(command, args, {
+		encoding: "utf8",
+		timeout: 60_000,
+		cwd: projectDir,
+	});
 
 	if (result.error) {
 		return {
 			success: false,
 			diagnostics: [],
-			error: `Failed to run tsc: ${result.error.message}`,
+			error: `Failed to run ${checker}: ${result.error.message}`,
 		};
 	}
 
@@ -103,7 +111,7 @@ export function getProjectDiagnostics(
 		return {
 			success: false,
 			diagnostics: [],
-			error: `tsc terminated by signal: ${result.signal}`,
+			error: `${checker} terminated by signal: ${result.signal}`,
 		};
 	}
 
@@ -118,14 +126,17 @@ export function getProjectDiagnostics(
 		}
 	}
 
-	// tsc failed without any parseable diagnostics (e.g. bad tsconfig, crash).
+	// The checker failed without any parseable diagnostics (e.g. bad tsconfig, crash).
 	// Checked before filtering so errors in other files don't look like a failure.
+	// bun check prints the error to stdout and its summary to stderr, so keep both.
 	if (result.status !== 0 && diagnostics.length === 0) {
-		const errorOutput = stderr.trim() || stdout.trim();
+		const errorOutput = [stderr.trim(), stdout.trim()]
+			.filter(Boolean)
+			.join("\n");
 		return {
 			success: false,
 			diagnostics: [],
-			error: errorOutput || "tsc failed without parseable output",
+			error: errorOutput || `${checker} failed without parseable output`,
 		};
 	}
 

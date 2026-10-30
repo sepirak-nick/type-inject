@@ -136,6 +136,7 @@ This gives the LLM immediate feedback to fix type errors without manual interven
 - Shows errors in other project files (`<project_diagnostics>`)
 - Limits: 20 errors per file, 5 files max for project diagnostics
 - Requires a `tsconfig.json` in the project (searches up from the file)
+- Checks with `bun check` (Bun 1.4+). Set `TYPE_INJECT_CHECKER=tsc` to use the project's `tsc` instead
 
 ### MCP Tools
 

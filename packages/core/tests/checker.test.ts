@@ -33,7 +33,7 @@ describe("getProjectDiagnostics", () => {
 		expect(result).toEqual({ success: true, diagnostics: [] });
 	});
 
-	test("returns raw tsc output when tsc fails without diagnostics", () => {
+	test("returns raw checker output when it fails without diagnostics", () => {
 		const result = getProjectDiagnostics(
 			path.join(fixtureDir, "missing-tsconfig.json"),
 		);
