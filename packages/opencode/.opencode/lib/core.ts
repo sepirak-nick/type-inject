@@ -1,7 +1,8 @@
-import { existsSync } from "node:fs";
+import { existsSync, readdirSync } from "node:fs";
 import path from "node:path";
 import {
 	CHARS_PER_TOKEN,
+	type CheckResult,
 	type Config,
 	ContentFormatter,
 	defaultConfig,
@@ -11,6 +12,7 @@ import {
 	formatDiagnostics,
 	getProjectDiagnostics,
 	isBarrelFile,
+	type LookupResult,
 	prioritizeTypes,
 	TypeExtractor,
 	TypeLookup,
@@ -74,19 +76,38 @@ export function createTypeInject(directory: string): TypeInject | undefined {
 		return undefined;
 	}
 
-	const tsConfigPath = path.join(directory, "tsconfig.json");
-	if (!existsSync(tsConfigPath)) {
+	// A root tsconfig.json covers the whole directory. Without one (a monorepo
+	// whose packages each have their own), every nested tsconfig.json is a project.
+	const rootTsconfig = path.join(directory, "tsconfig.json");
+	const projectTsconfigs = existsSync(rootTsconfig)
+		? [rootTsconfig]
+		: findTsconfigs(directory);
+	if (projectTsconfigs.length === 0) {
 		if (config.debug) {
-			console.log(
-				`[TypeInject] Skipping - no tsconfig.json found at: ${tsConfigPath}`,
-			);
+			console.log(`[TypeInject] Skipping - no tsconfig.json in: ${directory}`);
 		}
 		return undefined;
 	}
 
-	const extractor = new TypeExtractor(directory, config);
 	const formatter = new ContentFormatter(config);
-	const typeLookup = new TypeLookup(directory, config);
+	const extractors = new Map<string, TypeExtractor>();
+	const lookups = new Map<string, TypeLookup>();
+	const extractorFor = (tsconfig: string) =>
+		getOrCreate(
+			extractors,
+			tsconfig,
+			() => new TypeExtractor(path.dirname(tsconfig), config),
+		);
+	const lookupFor = (tsconfig: string) =>
+		getOrCreate(
+			lookups,
+			tsconfig,
+			() => new TypeLookup(path.dirname(tsconfig), config),
+		);
+	const allLookups = () => projectTsconfigs.map(lookupFor);
+	/** The tsconfig governing a file: the nearest one, else the first project. */
+	const tsconfigFor = (file: string) =>
+		findNearestTsconfig(file, directory) ?? (projectTsconfigs[0] as string);
 
 	if (config.debug) {
 		console.log("✅ [TypeInject] Plugin initialized successfully");
@@ -128,12 +149,20 @@ export function createTypeInject(directory: string): TypeInject | undefined {
 			},
 			execute(args) {
 				const name = args.name as string;
-				const result = typeLookup.findType(name, {
-					exact: (args.exact as boolean | undefined) ?? true,
-					kind: args.kind as ExtractedTypeKind[] | undefined,
-					includeUsages: (args.includeUsages as boolean | undefined) ?? false,
-					limit: (args.limit as number | undefined) ?? 5,
-				});
+				const limit = (args.limit as number | undefined) ?? 5;
+				const result = mergeLookups(
+					allLookups().map((lookup) =>
+						lookup.findType(name, {
+							exact: (args.exact as boolean | undefined) ?? true,
+							kind: args.kind as ExtractedTypeKind[] | undefined,
+							includeUsages:
+								(args.includeUsages as boolean | undefined) ?? false,
+							limit,
+						}),
+					),
+					directory,
+					limit,
+				);
 
 				if (!result.found) {
 					return `No types found matching "${name}"`;
@@ -209,16 +238,28 @@ export function createTypeInject(directory: string): TypeInject | undefined {
 				},
 			},
 			execute(args) {
-				const results = typeLookup.listTypeNames({
-					kind: args.kind as ExtractedTypeKind[] | undefined,
-					limit: (args.limit as number | undefined) ?? 100,
-				});
+				const limit = (args.limit as number | undefined) ?? 100;
+				const lookupsInScope = allLookups();
+				const results = lookupsInScope
+					.flatMap((lookup) =>
+						lookup.listTypeNames({
+							kind: args.kind as ExtractedTypeKind[] | undefined,
+							limit,
+						}),
+					)
+					.slice(0, limit);
 
 				if (results.length === 0) {
 					return "No types found in the project";
 				}
 
-				const stats = typeLookup.getStats();
+				const stats = lookupsInScope
+					.map((lookup) => lookup.getStats())
+					.reduce((sum, s) => ({
+						totalTypes: sum.totalTypes + s.totalTypes,
+						totalFiles: sum.totalFiles + s.totalFiles,
+						indexed: sum.indexed && s.indexed,
+					}));
 				const lines: string[] = [];
 				lines.push(
 					`Found ${stats.totalTypes} types in ${stats.totalFiles} files. Showing ${results.length}:`,
@@ -243,11 +284,13 @@ export function createTypeInject(directory: string): TypeInject | undefined {
 			},
 			execute(args) {
 				const file = args.file as string | undefined;
-				const effectiveTsconfig = file
-					? (findNearestTsconfig(file, directory) ?? tsConfigPath)
-					: tsConfigPath;
-
-				const result = getProjectDiagnostics(effectiveTsconfig, file);
+				const result = file
+					? getProjectDiagnostics(tsconfigFor(file), file)
+					: mergeDiagnostics(
+							projectTsconfigs.map((tsconfig) =>
+								getProjectDiagnostics(tsconfig),
+							),
+						);
 
 				if (result.error) {
 					return result.error;
@@ -308,7 +351,10 @@ export function createTypeInject(directory: string): TypeInject | undefined {
 			}
 
 			const startTime = Date.now();
-			const rawTypes = extractor.extract(filePath, lineRange);
+			const rawTypes = extractorFor(tsconfigFor(filePath)).extract(
+				filePath,
+				lineRange,
+			);
 			const extractTime = Date.now() - startTime;
 
 			if (config.debug) {
@@ -363,6 +409,74 @@ export function createTypeInject(directory: string): TypeInject | undefined {
 	}
 
 	return { tools, inject };
+}
+
+const SKIPPED_DIRS = new Set([
+	"node_modules",
+	"vendor",
+	"dist",
+	"build",
+	"coverage",
+]);
+
+/** tsconfig.json files below `directory`, skipping dependencies, build output and dot directories. */
+function findTsconfigs(directory: string, depth = 0): string[] {
+	if (depth > 4) return [];
+	const found: string[] = [];
+	for (const entry of readdirSync(directory, { withFileTypes: true })) {
+		if (entry.isFile() && entry.name === "tsconfig.json") {
+			found.push(path.join(directory, entry.name));
+		} else if (
+			entry.isDirectory() &&
+			!entry.name.startsWith(".") &&
+			!SKIPPED_DIRS.has(entry.name)
+		) {
+			found.push(...findTsconfigs(path.join(directory, entry.name), depth + 1));
+		}
+	}
+	return found;
+}
+
+function getOrCreate<K, V>(map: Map<K, V>, key: K, create: () => V): V {
+	let value = map.get(key);
+	if (value === undefined) {
+		value = create();
+		map.set(key, value);
+	}
+	return value;
+}
+
+/** Combines per-project lookups, with paths made relative to the session directory. */
+function mergeLookups(
+	results: LookupResult[],
+	directory: string,
+	limit: number,
+): LookupResult {
+	const relative = <T extends { filePath: string }>(item: T): T => ({
+		...item,
+		relativePath: path.relative(directory, item.filePath),
+	});
+	const types = results
+		.flatMap((result) => result.types)
+		.slice(0, limit)
+		.map((type) => ({ ...relative(type), usedIn: type.usedIn?.map(relative) }));
+	return {
+		found: types.length > 0,
+		totalMatches: results.reduce((sum, r) => sum + r.totalMatches, 0),
+		types,
+		searchTimeMs: results.reduce((sum, r) => sum + r.searchTimeMs, 0),
+		indexBuilt: results.some((r) => r.indexBuilt),
+	};
+}
+
+function mergeDiagnostics(results: CheckResult[]): CheckResult {
+	const diagnostics = results.flatMap((result) => result.diagnostics);
+	const errors = results.flatMap((result) => result.error ?? []);
+	return {
+		success: errors.length === 0 && diagnostics.length === 0,
+		diagnostics,
+		...(errors.length > 0 ? { error: errors.join("\n\n") } : {}),
+	};
 }
 
 function isTypeScriptFile(filePath: string): boolean {

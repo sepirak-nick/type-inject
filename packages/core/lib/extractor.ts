@@ -1,16 +1,16 @@
 import * as path from "node:path";
 import {
-	Project,
-	type TsMorphProject,
-	type SourceFile,
-	SyntaxKind,
-	VariableDeclarationKind,
-} from "./ts-morph.ts";
-import {
 	extractSvelteScripts,
 	loadSvelteParser,
 	type SvelteParser,
 } from "./svelte-utils.ts";
+import {
+	Project,
+	type SourceFile,
+	SyntaxKind,
+	type TsMorphProject,
+	VariableDeclarationKind,
+} from "./ts-morph.ts";
 import type { Config, ExtractedType } from "./types.ts";
 
 export class TypeExtractor {
@@ -714,9 +714,19 @@ export class TypeExtractor {
 		for (const importDecl of imports) {
 			const moduleSpecifier = importDecl.getModuleSpecifierValue();
 
-			// Skip node_modules imports (only process relative imports)
+			// Non-relative imports are followed only when the compiler resolves them
+			// to project sources (tsconfig paths, workspace packages), not node_modules.
 			if (!moduleSpecifier.startsWith(".")) {
-				continue;
+				const resolved = importDecl
+					.getModuleSpecifierSourceFile()
+					?.getFilePath();
+				if (
+					!resolved ||
+					resolved.includes("/node_modules/") ||
+					resolved.endsWith(".d.ts")
+				) {
+					continue;
+				}
 			}
 
 			// Skip type-only imports if disabled

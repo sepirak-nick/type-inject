@@ -8,6 +8,7 @@
 	"exports": {
 		".": {
 			"types": "./dist/index.d.ts",
+			"bun": "./lib/index.ts",
 			"default": "./dist/index.js"
 		},
 		"./extractor": {
