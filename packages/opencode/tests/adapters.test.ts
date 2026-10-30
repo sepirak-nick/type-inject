@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import path from "node:path";
 import plugin from "../.opencode/plugin/type-inject.ts";
@@ -79,7 +79,7 @@ describe("opencode v2 adapter", () => {
 		expect(content).toMatch(/\[offset=[1-9]\d*,limit=\d+\]/);
 	});
 
-	test("injects types into the first text part of a full read", async () => {
+	test("leaves reads alone unless TYPE_INJECT_READS=on", async () => {
 		const { afterHook } = await setupV2();
 		const display = `Read file ${relPath}\n1: ${lines[0]}`;
 		const event = v2ReadEvent(
@@ -87,23 +87,43 @@ describe("opencode v2 adapter", () => {
 			display,
 		);
 		await afterHook(event);
-		const [part] = event.result.content;
-		expect(part.type).toBe("text");
-		expect(part.text).toStartWith("<types");
-		expect(part.text).toContain("UsedType");
-		expect(part.text).toEndWith(display);
+		expect(event.result.content[0].text).toBe(display);
 	});
 
-	test("injects for 1-based text pages", async () => {
-		const { afterHook } = await setupV2();
-		// Line 4 is `export function doSomething(input: UsedType): AnotherUsedType {`
-		const event = v2ReadEvent(
-			{ type: "text-page", content: lines[3], offset: 4, mime: "text/plain" },
-			`Read file ${relPath}, lines 4-4\n4: ${lines[3]}`,
-			{ path: relPath, offset: 4, limit: 1 },
-		);
-		await afterHook(event);
-		expect(event.result.content[0].text).toStartWith("<types");
+	describe("with TYPE_INJECT_READS=on", () => {
+		beforeEach(() => {
+			process.env.TYPE_INJECT_READS = "on";
+		});
+		afterEach(() => {
+			delete process.env.TYPE_INJECT_READS;
+		});
+
+		test("injects types into the first text part of a full read", async () => {
+			const { afterHook } = await setupV2();
+			const display = `Read file ${relPath}\n1: ${lines[0]}`;
+			const event = v2ReadEvent(
+				{ type: "file", content: raw, encoding: "utf8", mime: "text/plain" },
+				display,
+			);
+			await afterHook(event);
+			const [part] = event.result.content;
+			expect(part.type).toBe("text");
+			expect(part.text).toStartWith("<types");
+			expect(part.text).toContain("UsedType");
+			expect(part.text).toEndWith(display);
+		});
+
+		test("injects for 1-based text pages", async () => {
+			const { afterHook } = await setupV2();
+			// Line 4 is `export function doSomething(input: UsedType): AnotherUsedType {`
+			const event = v2ReadEvent(
+				{ type: "text-page", content: lines[3], offset: 4, mime: "text/plain" },
+				`Read file ${relPath}, lines 4-4\n4: ${lines[3]}`,
+				{ path: relPath, offset: 4, limit: 1 },
+			);
+			await afterHook(event);
+			expect(event.result.content[0].text).toStartWith("<types");
+		});
 	});
 
 	test("leaves directories, errors, binaries and other tools alone", async () => {

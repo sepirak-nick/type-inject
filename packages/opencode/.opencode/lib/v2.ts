@@ -97,7 +97,12 @@ export async function setup(ctx: Context) {
 			}
 		}),
 
+		// Injection on reads is off by default: it roughly triples the tokens a
+		// TypeScript read costs. TYPE_INJECT_READS=on turns it back on.
 		ctx.tool.hook("execute.after", (event) => {
+			if (process.env.TYPE_INJECT_READS !== "on") {
+				return;
+			}
 			if (event.tool !== "read" || event.status !== "completed") {
 				return;
 			}
